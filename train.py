@@ -28,12 +28,49 @@ from typing import Optional
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
 from mixformer.config import MixFormerConfig
 from mixformer.data import create_dataloader
 from mixformer.model import MixFormer
+
+
+def is_dist_initialized() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def get_rank() -> int:
+    return dist.get_rank() if is_dist_initialized() else 0
+
+
+def get_world_size() -> int:
+    return dist.get_world_size() if is_dist_initialized() else 1
+
+
+def is_main_process() -> bool:
+    return get_rank() == 0
+
+
+def gather_arrays(local: np.ndarray) -> np.ndarray:
+    """All-gather numpy arrays across DDP ranks; returns concatenated array on every rank."""
+    if not is_dist_initialized():
+        return local
+    world = get_world_size()
+    gathered = [None] * world
+    dist.all_gather_object(gathered, local)
+    return np.concatenate(gathered)
+
+
+def reduce_scalar(value: float, op=dist.ReduceOp.SUM if dist.is_available() else None) -> float:
+    """All-reduce a scalar across DDP ranks; returns sum (for averaging, divide by world_size)."""
+    if not is_dist_initialized():
+        return value
+    t = torch.tensor([value], dtype=torch.float64, device=f"cuda:{int(os.environ.get('LOCAL_RANK', 0))}")
+    dist.all_reduce(t, op=op)
+    return t.item()
 
 # 设置日志
 logging.basicConfig(
@@ -117,25 +154,34 @@ class Trainer:
         use_amp: bool = False,
         device: str = "cpu",
         log_interval: int = 50,
+        ddp: bool = False,
     ):
-        self.model = model.to(device)
+        model = model.to(device)
+        self.raw_model = model
+        if ddp:
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            self.model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        else:
+            self.model = model
         self.config = config
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.epochs = epochs
         self.save_dir = Path(save_dir)
-        self.save_dir.mkdir(parents=True, exist_ok=True)
+        if is_main_process():
+            self.save_dir.mkdir(parents=True, exist_ok=True)
         self.use_amp = use_amp
         self.device = device
         self.log_interval = log_interval
         self.moe_aux_loss_weight = config.moe_aux_loss_weight
+        self.ddp = ddp
 
         # 损失函数: BCE Loss
         self.criterion = nn.BCELoss()
 
         # 优化器: Adam (工业级推荐系统常用)
         self.optimizer = torch.optim.Adam(
-            model.parameters(),
+            self.model.parameters(),
             lr=lr,
             weight_decay=weight_decay,
         )
@@ -185,6 +231,9 @@ class Trainer:
     def train_epoch(self, epoch: int) -> dict:
         """训练一个 epoch。"""
         self.model.train()
+        # DDP: set sampler epoch for proper shuffling
+        if self.ddp and hasattr(self.train_loader, "sampler") and hasattr(self.train_loader.sampler, "set_epoch"):
+            self.train_loader.sampler.set_epoch(epoch)
         total_loss = 0.0
         all_labels = []
         all_preds = []
@@ -201,12 +250,17 @@ class Trainer:
                 device_type=device_type,
                 enabled=self.use_amp,
             ):
-                pred = self._forward_batch(batch)  # (batch, 1)
-                loss = self.criterion(pred.squeeze(-1), batch["label"])
+                pred = self._forward_batch(batch)  # (batch, 1) - sigmoid output
 
-                # 添加 MoE 负载均衡辅助损失
-                if hasattr(self.model, 'moe_aux_loss') and self.model.moe_aux_loss is not None:
-                    loss = loss + self.moe_aux_loss_weight * self.model.moe_aux_loss
+            # BCELoss 在 autocast 下不安全 (sigmoid 已是 fp32 → fp16 会丢精度)
+            # 在 autocast 外计算: pred 已是模型最终输出 (fp32 sigmoid)
+            pred_fp32 = pred.float()
+            loss = self.criterion(pred_fp32.squeeze(-1), batch["label"])
+
+            # 添加 MoE 负载均衡辅助损失 (DDP 模式下需访问 .module)
+            inner_model = self.model.module if self.ddp else self.model
+            if hasattr(inner_model, 'moe_aux_loss') and inner_model.moe_aux_loss is not None:
+                loss = loss + self.moe_aux_loss_weight * inner_model.moe_aux_loss
 
             # 反向传播
             self.scaler.scale(loss).backward()
@@ -222,10 +276,10 @@ class Trainer:
             self.global_step += 1
 
             all_labels.append(batch["label"].detach().cpu().numpy())
-            all_preds.append(pred.squeeze(-1).detach().cpu().numpy())
+            all_preds.append(pred_fp32.squeeze(-1).detach().cpu().numpy())
 
-            # 日志
-            if (batch_idx + 1) % self.log_interval == 0:
+            # 日志 (仅 rank 0)
+            if is_main_process() and (batch_idx + 1) % self.log_interval == 0:
                 avg_loss = total_loss / num_batches
                 lr = self.scheduler.get_last_lr()[0]
                 logger.info(
@@ -233,12 +287,20 @@ class Trainer:
                     f"Loss: {avg_loss:.6f} | LR: {lr:.6f}"
                 )
 
-        # Epoch 级别指标
-        all_labels = np.concatenate(all_labels)
-        all_preds = np.concatenate(all_preds)
-        epoch_loss = total_loss / num_batches
-        epoch_auc = compute_auc(all_labels, all_preds)
-        epoch_logloss = compute_logloss(all_labels, all_preds)
+        # Epoch 级别指标 (DDP: all-gather across ranks)
+        local_labels = np.concatenate(all_labels)
+        local_preds = np.concatenate(all_preds)
+        all_labels_full = gather_arrays(local_labels)
+        all_preds_full = gather_arrays(local_preds)
+
+        if self.ddp:
+            loss_sum = reduce_scalar(total_loss)
+            batches_sum = reduce_scalar(float(num_batches))
+            epoch_loss = loss_sum / batches_sum
+        else:
+            epoch_loss = total_loss / num_batches
+        epoch_auc = compute_auc(all_labels_full, all_preds_full)
+        epoch_logloss = compute_logloss(all_labels_full, all_preds_full)
 
         return {
             "loss": epoch_loss,
@@ -267,18 +329,27 @@ class Trainer:
                 enabled=self.use_amp,
             ):
                 pred = self._forward_batch(batch)
-                loss = self.criterion(pred.squeeze(-1), batch["label"])
+            pred_fp32 = pred.float()
+            loss = self.criterion(pred_fp32.squeeze(-1), batch["label"])
 
             total_loss += loss.item()
             num_batches += 1
             all_labels.append(batch["label"].cpu().numpy())
-            all_preds.append(pred.squeeze(-1).cpu().numpy())
+            all_preds.append(pred_fp32.squeeze(-1).cpu().numpy())
 
-        all_labels = np.concatenate(all_labels)
-        all_preds = np.concatenate(all_preds)
-        val_loss = total_loss / num_batches
-        val_auc = compute_auc(all_labels, all_preds)
-        val_logloss = compute_logloss(all_labels, all_preds)
+        local_labels = np.concatenate(all_labels)
+        local_preds = np.concatenate(all_preds)
+        all_labels_full = gather_arrays(local_labels)
+        all_preds_full = gather_arrays(local_preds)
+
+        if self.ddp:
+            loss_sum = reduce_scalar(total_loss)
+            batches_sum = reduce_scalar(float(num_batches))
+            val_loss = loss_sum / batches_sum
+        else:
+            val_loss = total_loss / num_batches
+        val_auc = compute_auc(all_labels_full, all_preds_full)
+        val_logloss = compute_logloss(all_labels_full, all_preds_full)
 
         return {
             "val_loss": val_loss,
@@ -287,10 +358,13 @@ class Trainer:
         }
 
     def save_checkpoint(self, epoch: int, metrics: dict, is_best: bool = False):
-        """保存模型 checkpoint。"""
+        """保存模型 checkpoint (仅 rank 0)。"""
+        if not is_main_process():
+            return
+        model_to_save = self.model.module if self.ddp else self.model
         checkpoint = {
             "epoch": epoch,
-            "model_state_dict": self.model.state_dict(),
+            "model_state_dict": model_to_save.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
             "scaler_state_dict": self.scaler.state_dict(),
@@ -346,28 +420,30 @@ class Trainer:
 
     def train(self):
         """完整训练流程。"""
-        logger.info("=" * 60)
-        logger.info("MixFormer Training Started")
-        logger.info(f"Model: {self.model.__class__.__name__}")
-        logger.info(f"Config: {self.config}")
-        logger.info(f"Total parameters: {self.model.get_num_params():,}")
-        logger.info(f"Trainable parameters: {self.model.get_num_trainable_params():,}")
-        logger.info(f"Device: {self.device}")
-        logger.info(f"AMP: {self.use_amp}")
-        logger.info(f"Flash Attention: enabled (PyTorch SDPA)")
-        if self.config.use_moe:
-            logger.info(
-                f"Sparse MoE: enabled (experts={self.config.num_experts}, "
-                f"active={self.config.num_active_experts}, "
-                f"aux_weight={self.config.moe_aux_loss_weight})"
-            )
-        else:
-            logger.info("Sparse MoE: disabled (standard FFN)")
-        logger.info(f"Epochs: {self.epochs}")
-        logger.info(f"Train batches: {len(self.train_loader)}")
-        if self.val_loader:
-            logger.info(f"Val batches: {len(self.val_loader)}")
-        logger.info("=" * 60)
+        if is_main_process():
+            logger.info("=" * 60)
+            logger.info("MixFormer Training Started")
+            logger.info(f"Model: {self.raw_model.__class__.__name__}")
+            logger.info(f"Config: {self.config}")
+            logger.info(f"Total parameters: {self.raw_model.get_num_params():,}")
+            logger.info(f"Trainable parameters: {self.raw_model.get_num_trainable_params():,}")
+            logger.info(f"Device: {self.device}")
+            logger.info(f"World size (DDP ranks): {get_world_size()}")
+            logger.info(f"AMP: {self.use_amp}")
+            logger.info(f"Flash Attention: enabled (PyTorch SDPA)")
+            if self.config.use_moe:
+                logger.info(
+                    f"Sparse MoE: enabled (experts={self.config.num_experts}, "
+                    f"active={self.config.num_active_experts}, "
+                    f"aux_weight={self.config.moe_aux_loss_weight})"
+                )
+            else:
+                logger.info("Sparse MoE: disabled (standard FFN)")
+            logger.info(f"Epochs: {self.epochs}")
+            logger.info(f"Train batches per rank: {len(self.train_loader)}")
+            if self.val_loader:
+                logger.info(f"Val batches per rank: {len(self.val_loader)}")
+            logger.info("=" * 60)
 
         training_history = []
 
@@ -391,8 +467,11 @@ class Trainer:
             if is_best:
                 self.best_auc = current_auc
 
-            # 保存 checkpoint
+            # 保存 checkpoint (内部 gate rank 0)
             self.save_checkpoint(epoch, metrics, is_best=is_best)
+
+            if not is_main_process():
+                continue
 
             # 打印 Epoch 总结
             logger.info("-" * 60)
@@ -413,20 +492,21 @@ class Trainer:
             logger.info("-" * 60)
 
         # 保存训练历史
-        history_path = self.save_dir / "training_history.json"
-        serializable_history = []
-        for entry in training_history:
-            serializable_history.append(
-                {k: float(v) if isinstance(v, (np.floating, np.integer)) else v
-                 for k, v in entry.items()}
-            )
-        with open(history_path, "w") as f:
-            json.dump(serializable_history, f, indent=2)
-        logger.info(f"Training history saved: {history_path}")
+        if is_main_process():
+            history_path = self.save_dir / "training_history.json"
+            serializable_history = []
+            for entry in training_history:
+                serializable_history.append(
+                    {k: float(v) if isinstance(v, (np.floating, np.integer)) else v
+                     for k, v in entry.items()}
+                )
+            with open(history_path, "w") as f:
+                json.dump(serializable_history, f, indent=2)
+            logger.info(f"Training history saved: {history_path}")
 
-        logger.info("=" * 60)
-        logger.info(f"Training completed! Best AUC: {self.best_auc:.4f}")
-        logger.info("=" * 60)
+            logger.info("=" * 60)
+            logger.info(f"Training completed! Best AUC: {self.best_auc:.4f}")
+            logger.info("=" * 60)
 
         return training_history
 
@@ -493,37 +573,60 @@ def get_device(device_arg: str) -> str:
     return "cpu"
 
 
+def init_distributed():
+    """Initialize torch.distributed if launched via torchrun.
+
+    Returns: (is_ddp, local_rank, world_size).
+    """
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl", init_method="env://")
+        return True, local_rank, dist.get_world_size()
+    return False, 0, 1
+
+
 def main():
     args = parse_args()
 
+    # DDP init (no-op if not launched via torchrun)
+    is_ddp, local_rank, world_size = init_distributed()
+
     # 设置随机种子
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    torch.manual_seed(args.seed + local_rank)
+    np.random.seed(args.seed + local_rank)
 
     # 设备
-    device = get_device(args.device)
-    logger.info(f"Using device: {device}")
+    if is_ddp:
+        device = f"cuda:{local_rank}"
+    else:
+        device = get_device(args.device)
+    if is_main_process():
+        logger.info(f"Using device: {device} | DDP: {is_ddp} | world_size: {world_size}")
 
     # 加载元数据
-    logger.info("=" * 60)
-    logger.info("MixFormer Training with Alibaba UserBehavior Dataset")
-    logger.info("=" * 60)
+    if is_main_process():
+        logger.info("=" * 60)
+        logger.info("MixFormer Training with Alibaba UserBehavior Dataset")
+        logger.info("=" * 60)
 
     meta_path = os.path.join(args.data_dir, "meta.pkl")
     if not os.path.exists(meta_path):
-        logger.error(
-            f"Metadata not found: {meta_path}\n"
-            f"Please run preprocessing first:\n"
-            f"  python scripts/download_alibaba.py --generate_mock --output_dir {args.data_dir}\n"
-            f"  or\n"
-            f"  python scripts/download_alibaba.py --raw_data_path /path/to/UserBehavior.csv --output_dir {args.data_dir}"
-        )
+        if is_main_process():
+            logger.error(
+                f"Metadata not found: {meta_path}\n"
+                f"Please run preprocessing first:\n"
+                f"  python scripts/download_alibaba.py --generate_mock --output_dir {args.data_dir}\n"
+                f"  or\n"
+                f"  python scripts/download_alibaba.py --raw_data_path /path/to/UserBehavior.csv --output_dir {args.data_dir}"
+            )
         return
 
     with open(meta_path, "rb") as f:
         meta = pickle.load(f)
 
-    logger.info(f"Dataset metadata: {meta}")
+    if is_main_process():
+        logger.info(f"Dataset metadata: {meta}")
 
     # 创建配置 (使用实际数据的元信息)
     if args.config == "medium":
@@ -539,7 +642,8 @@ def main():
             num_users=meta["num_users"] + 1,
         )
 
-    logger.info(f"Model config: {config}")
+    if is_main_process():
+        logger.info(f"Model config: {config}")
 
     # 创建数据加载器
     train_loader = create_dataloader(
@@ -549,6 +653,7 @@ def main():
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
+        distributed=is_ddp,
     )
 
     # 测试集作为验证
@@ -559,13 +664,15 @@ def main():
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
+        distributed=is_ddp,
     )
 
     # 创建模型
     model = MixFormer(config)
 
-    logger.info(f"Model type: {model.__class__.__name__}")
-    logger.info(f"Total parameters: {model.get_num_params():,}")
+    if is_main_process():
+        logger.info(f"Model type: {model.__class__.__name__}")
+        logger.info(f"Total parameters: {model.get_num_params():,}")
 
     # 创建训练器
     trainer = Trainer(
@@ -580,10 +687,14 @@ def main():
         use_amp=args.amp,
         device=device,
         log_interval=args.log_interval,
+        ddp=is_ddp,
     )
 
     # 开始训练
     trainer.train()
+
+    if is_ddp:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

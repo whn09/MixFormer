@@ -189,6 +189,8 @@ def build_dataset(
     neg_ratio: int = 1,
     min_hist_len: int = 2,
     seed: int = 42,
+    max_history: int = 50,
+    max_positions_per_user: int = 0,
 ) -> Tuple[List[dict], List[dict]]:
     """按 DIN 论文方式构建训练/测试样本。
 
@@ -204,11 +206,16 @@ def build_dataset(
         neg_ratio: 负样本数比例 (每个正样本配几个负样本)
         min_hist_len: 用户最少历史行为数 (少于此数的用户跳过)
         seed: 随机种子
+        max_history: 历史序列截断长度 (避免存全长序列爆磁盘)
+        max_positions_per_user: 每用户最多取多少个 (训练) 正样本位置, 0 表示全取
 
     Returns:
         (train_samples, test_samples)
     """
-    logger.info("Building train/test samples...")
+    logger.info(
+        f"Building train/test samples (max_history={max_history}, "
+        f"max_positions_per_user={max_positions_per_user})..."
+    )
     rng = random.Random(seed)
 
     all_item_ids = list(range(1, num_items + 1))  # [1, num_items]
@@ -216,8 +223,17 @@ def build_dataset(
     train_samples = []
     test_samples = []
     skipped_users = 0
+    processed = 0
+    total_users = len(user_seqs)
 
     for user_id, seq in user_seqs.items():
+        processed += 1
+        if processed % 100000 == 0:
+            logger.info(
+                f"  Processed {processed:,}/{total_users:,} users "
+                f"({len(train_samples):,} train, {len(test_samples):,} test)"
+            )
+
         if len(seq) < min_hist_len:
             skipped_users += 1
             continue
@@ -225,10 +241,19 @@ def build_dataset(
         # 该用户的正向交互物品集合
         user_items = set(item_id for item_id, _, _ in seq)
 
-        for i in range(1, len(seq)):
-            # 历史行为: seq[0:i]
-            hist_items = np.array([s[0] for s in seq[:i]], dtype=np.int64)
-            hist_cates = np.array([s[1] for s in seq[:i]], dtype=np.int64)
+        # 训练正样本位置: 1 .. len(seq)-2; 测试正样本: len(seq)-1
+        train_indices = list(range(1, len(seq) - 1))
+        if max_positions_per_user > 0 and len(train_indices) > max_positions_per_user:
+            train_indices = rng.sample(train_indices, max_positions_per_user)
+            train_indices.sort()
+
+        positions = train_indices + [len(seq) - 1]
+
+        for i in positions:
+            # 历史行为: seq[max(0, i - max_history) : i] (左截断保持最近)
+            hist_start = max(0, i - max_history) if max_history > 0 else 0
+            hist_items = np.array([s[0] for s in seq[hist_start:i]], dtype=np.int64)
+            hist_cates = np.array([s[1] for s in seq[hist_start:i]], dtype=np.int64)
 
             # 目标物品 (正样本)
             target_item = seq[i][0]
@@ -423,6 +448,8 @@ def process_real_data(args):
         neg_ratio=args.neg_ratio,
         min_hist_len=args.min_hist_len,
         seed=args.seed,
+        max_history=args.max_history,
+        max_positions_per_user=args.max_positions_per_user,
     )
 
     # 6. 保存
@@ -513,6 +540,19 @@ def main():
         help="Minimum history length to include a user",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument(
+        "--max_history",
+        type=int,
+        default=50,
+        help="Truncate per-sample history to last N items (matches config.seq_length; 0 to disable)",
+    )
+    parser.add_argument(
+        "--max_positions_per_user",
+        type=int,
+        default=0,
+        help="Limit number of training positive positions per user (0 = use all). "
+             "Set e.g. 20 to subsample dense users and avoid disk blowup on full 1e8 dataset.",
+    )
 
     # 模拟数据参数
     parser.add_argument(

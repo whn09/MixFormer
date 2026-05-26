@@ -172,6 +172,7 @@ def create_dataloader(
     batch_size: int = 256,
     shuffle: bool = True,
     num_workers: int = 4,
+    distributed: bool = False,
 ) -> DataLoader:
     """创建 Alibaba UserBehavior 数据集 DataLoader。
 
@@ -179,9 +180,10 @@ def create_dataloader(
         data_dir: 预处理后的数据目录
         config: MixFormer 模型配置
         split: 数据集拆分 ("train" | "test")
-        batch_size: 批量大小
-        shuffle: 是否打乱数据
+        batch_size: 批量大小 (per-rank)
+        shuffle: 是否打乱数据 (DDP 模式下由 sampler 接管)
         num_workers: 数据加载工作线程数
+        distributed: 是否使用 DistributedSampler 切分数据
 
     Returns:
         DataLoader 实例
@@ -192,12 +194,19 @@ def create_dataloader(
         split=split,
         max_seq_length=config.seq_length,
     )
+    sampler = None
+    if distributed:
+        from torch.utils.data.distributed import DistributedSampler
+        sampler = DistributedSampler(dataset, shuffle=shuffle, drop_last=(split == "train"))
+        shuffle = False
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
+        sampler=sampler,
         num_workers=num_workers,
         collate_fn=collate_fn,
         pin_memory=torch.cuda.is_available(),
         drop_last=(split == "train"),
+        persistent_workers=(num_workers > 0),
     )
