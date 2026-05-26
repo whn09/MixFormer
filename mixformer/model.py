@@ -29,7 +29,7 @@ try:
     from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
     _TORCHREC_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError, RuntimeError):
     pass
 
 
